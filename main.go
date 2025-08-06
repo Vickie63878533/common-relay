@@ -232,7 +232,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
         if resp.StatusCode == http.StatusUnprocessableEntity { // 422
 			log.Printf("INFO: ModifyResponse: Upstream returned 422 for key: '%s'. Attempting to remove it.", apiKey)
-			keyList.RemoveKey(apiKey)
+			// keyList.RemoveKey(apiKey)
 			return nil
 		}
 		return nil // Return nil to indicate no error during response modification
@@ -276,3 +276,4 @@ func main() {
 		log.Fatalf("Could not listen on %s: %v\n", port, err)
 	}
 }
+
