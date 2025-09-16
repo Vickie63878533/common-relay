@@ -21,6 +21,7 @@ const (
 var (
 	targetURL *url.URL
 	keyList   *KeyList
+	CHECK_MODEL string // 全局变量用于/check端点
 )
 
 // KeyList manages a list of API keys.
@@ -108,6 +109,15 @@ func (kl *KeyList) AvailableKeys() string {
 	return strings.Join(kl.keys, ",")
 }
 
+// GetAllKeys returns a copy of all keys.
+func (kl *KeyList) GetAllKeys() []string {
+	kl.mu.RLock()
+	defer kl.mu.RUnlock()
+	keysCopy := make([]string, len(kl.keys))
+	copy(keysCopy, kl.keys)
+	return keysCopy
+}
+
 // RandomlyPrintAvailableKeys prints all available keys with a 1/20 chance.
 // Keys are printed as a comma-separated string.
 func (kl *KeyList) RandomlyPrintAvailableKeys() {
@@ -144,6 +154,8 @@ func init() {
 	if err != nil {
 		log.Fatalf("Failed to initialize key list: %v", err)
 	}
+
+	CHECK_MODEL = os.Getenv("CHECK_MODEL")
 }
 
 // selectAPIKey 从提供的密钥列表中随机选择一个密钥
@@ -248,6 +260,95 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
+// handleCheck 检查所有 key 的状态
+func handleCheck(w http.ResponseWriter, r *http.Request) {
+	if CHECK_MODEL == "" {
+		http.Error(w, "CHECK_MODEL environment variable is not set.", http.StatusInternalServerError)
+		return
+	}
+
+	allKeys := keyList.GetAllKeys()
+	var aliveKeys []string
+	var failedKeys []string
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	client := &http.Client{
+		Timeout: 30 * time.Second, // 设置一个合理的超时
+	}
+
+	checkURL := targetURL.String() + "/v1/chat/completions"
+
+	for _, key := range allKeys {
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+
+			// 构造请求体
+			requestBody, err := json.Marshal(map[string]interface{}{
+				"model": CHECK_MODEL,
+				"messages": []map[string]string{
+					{"role": "user", "content": "Hi"},
+				},
+				"max_tokens": 5,
+			})
+			if err != nil {
+				log.Printf("Error creating request body for key %s: %v", key, err)
+				return
+			}
+
+			req, err := http.NewRequest("POST", checkURL, bytes.NewBuffer(requestBody))
+			if err != nil {
+				log.Printf("Error creating request for key %s: %v", key, err)
+				return
+			}
+
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+key)
+
+			resp, err := client.Do(req)
+			if err != nil {
+				mu.Lock()
+				failedKeys = append(failedKeys, fmt.Sprintf("%s request_error %v", key, err))
+				mu.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+
+			mu.Lock()
+			if resp.StatusCode == http.StatusOK {
+				aliveKeys = append(aliveKeys, key)
+			} else {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				failedKeys = append(failedKeys, fmt.Sprintf("%s %d %s", key, resp.StatusCode, string(bodyBytes)))
+			}
+			mu.Unlock()
+
+		}(key)
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	wg.Wait()
+
+	var responseBuilder strings.Builder
+	responseBuilder.WriteString("alive:\n")
+	for _, key := range aliveKeys {
+		responseBuilder.WriteString(key)
+		responseBuilder.WriteString("\n")
+	}
+
+	responseBuilder.WriteString("\nfail:\n")
+	for _, failInfo := range failedKeys {
+		responseBuilder.WriteString(failInfo)
+		responseBuilder.WriteString("\n")
+	}
+
+	w.Header().Set("Content-Type", contentTypeText)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(responseBuilder.String()))
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -263,12 +364,13 @@ func main() {
 	}
 
 	http.HandleFunc("/", handleRequest)
+	http.HandleFunc("/check", handleCheck) // 直接为 /check 注册处理器
 
 	server := &http.Server{
 		Addr:         ":" + port,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 60 * time.Second, // 对于流式响应，可能需要更长或无超时
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:  300 * time.Second,
+		WriteTimeout: 300 * time.Second, // 对于流式响应，可能需要更长或无超时
+		IdleTimeout:  600 * time.Second,
 	}
 
 	log.Printf("Starting server on port %s...", port)
@@ -276,4 +378,5 @@ func main() {
 		log.Fatalf("Could not listen on %s: %v\n", port, err)
 	}
 }
+
 
